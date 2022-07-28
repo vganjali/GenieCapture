@@ -1,0 +1,365 @@
+#!/bin/python3.8
+#=======================================================================
+#
+# grabImage.py
+#
+# Example showing how to grab 2 images from the first camera
+# detected and display one of them using a PIL Image.
+
+import sys
+import ctypes
+import time
+
+from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+import numpy as np
+import h5py
+from threading import Thread
+from multiprocessing import Array, Value, Process
+
+#
+# Get the common support code for the GigE-V Framework for Linux
+# (Change this if directory structure is changed).
+sys.path.append("./gigev_common")
+import pygigev
+import cv2 as cv
+# from genicam.genapi import NodeMap
+
+#=======================================================================
+# Utilties
+def ipAddr_from_string(s):
+  "Convert dotted IPv4 address to integer."
+  return reduce(lambda a,b: a<<8 | b, map(int, s.split(".")))
+
+def ipAddr_to_string(ip):
+  "Convert 32-bit integer to dotted IPv4 address."
+  return ".".join(map(lambda n: str(ip>>n & 0xFF), [24,16,8,0]))
+
+def grab_frame(buffPtr, buffer, index):
+	gevbuf = buffPtr.contents
+	im_size = ( gevbuf.h , gevbuf.w )
+	im_addr = ctypes.cast( gevbuf.address, ctypes.POINTER(ctypes.c_ubyte * gevbuf.recv_size) )
+	im = np.frombuffer(im_addr.contents,np.uint8).reshape(im_size)
+	im = cv.cvtColor(im,cv.COLOR_BayerRG2RGB)
+	buffer[index,:,:,:] = im
+	return buffer
+
+# Channels colormap
+channels = {
+	'R':LinearSegmentedColormap.from_list('R',[(0,'#000000'),(1,'#FF0000')]),
+	'G':LinearSegmentedColormap.from_list('G',[(0,'#000000'),(1,'#00FF00')]),
+	'B':LinearSegmentedColormap.from_list('B',[(0,'#000000'),(1,'#0000FF')])}
+
+# The basic program
+def acquisition(acq_status,buffer,buffer_write,write_ready,save):
+	# Initialize the API
+	pygigev.GevApiInitialize()
+
+	# Allocate a maximum number of camera info structures.
+	maxCameras = 16
+	numFound = (ctypes.c_uint32)(0)
+	camera_info = (pygigev.GEV_CAMERA_INFO * maxCameras)()
+
+	# Get the camera list 
+	status = pygigev.GevGetCameraList( camera_info, maxCameras, ctypes.byref(numFound) )
+	if ( status != 0  ):
+		print("Error ", status,"getting camera list - exitting")
+		quit()
+
+	if (numFound.value == 0):
+		print("No cameras found - exitting")
+		quit()
+		
+	# Proceed
+	print(numFound.value," Cameras found" )
+	for camIndex in range(numFound.value):
+		print("ip = ", ipAddr_to_string(camera_info[camIndex].ipAddr))
+	
+	# Select the first camera and open it.
+	camIndex = 0
+	print("Opening camera #", camIndex)
+	handle = (ctypes.c_void_p)()
+	status = pygigev.GevOpenCamera( camera_info[camIndex], pygigev.GevExclusiveMode, ctypes.byref(handle))
+
+	# Get the Width and Height (extra information)
+	feature_strlen = (ctypes.c_int)(pygigev.MAX_GEVSTRING_LENGTH)
+	unused = (ctypes.c_int)(0)
+	if (sys.version_info > (3, 0)):
+		width_name = b'Width'
+		height_name = b'Height'
+		framerate_name = b'AcquisitionFrameRateRaw'
+		pixelformat_name = b'PixelFormat'
+		exposure_name = b'ExposureTime'
+	else:
+		width_name = "Width"
+		height_name = "Height"
+		framerate_name = "AcquisitionFrameRateRaw"
+		pixelformat_name = "PixelFormat"
+		exposure_name = "ExposureTime"
+
+	width_str = ((ctypes.c_char)*feature_strlen.value)()
+	height_str = ((ctypes.c_char)*feature_strlen.value)()
+	framerate_str = ((ctypes.c_char)*feature_strlen.value)()
+	pixelformat_str = ((ctypes.c_char)*feature_strlen.value)()
+	exposure_str = ((ctypes.c_char)*feature_strlen.value)()
+
+	
+	status = pygigev.GevSetFeatureValueAsString( handle, height_name, f"{h}".encode())
+	print(hex(status))
+	status = pygigev.GevSetFeatureValueAsString( handle, width_name, f"{w}".encode())
+	print(hex(status))
+	status = pygigev.GevSetFeatureValueAsString( handle, framerate_name, f"{framerate*1000}".encode())
+	print(hex(status))
+	status = pygigev.GevSetFeatureValueAsString( handle, exposure_name, f"{exposure_time}".encode())
+	print(hex(status))
+	status = pygigev.GevSetFeatureValueAsString( handle, pixelformat_name, b"BayerRG8")
+	print(hex(status))
+	status = pygigev.GevGetFeatureValueAsString( handle, width_name, ctypes.byref(unused), feature_strlen, width_str)
+	print(hex(status))
+	status = pygigev.GevGetFeatureValueAsString( handle, height_name, ctypes.byref(unused), feature_strlen, height_str)
+	print(hex(status))
+	status = pygigev.GevGetFeatureValueAsString( handle, framerate_name, ctypes.byref(unused), feature_strlen, framerate_str)
+	print(hex(status))
+	status = pygigev.GevGetFeatureValueAsString( handle, pixelformat_name, ctypes.byref(unused), feature_strlen, pixelformat_str)
+	print(hex(status))
+	status = pygigev.GevGetFeatureValueAsString( handle, exposure_name, ctypes.byref(unused), feature_strlen, exposure_str)
+	print(hex(status))
+
+	print("status :", status," Width : ", width_str.value, " Height = ", height_str.value, " Frame Rate = ", framerate_str.value, " Pixel Format = ", pixelformat_str.value )
+
+	# Get the payload parameters 
+	print("Getting payload information :")
+	payload_size = (ctypes.c_uint64)()
+	pixel_format = (ctypes.c_uint32)()	
+	status = pygigev.GevGetPayloadParameters( handle, ctypes.byref(payload_size), ctypes.byref(pixel_format) )
+	pixel_format_unpacked = pygigev.GevGetUnpackedPixelType( pixel_format );
+	print("status :", status," payload_size : ", payload_size.value, " pixel_format = ", hex(pixel_format.value), " pixel_format_unpacked = ",hex(pixel_format_unpacked ))
+	
+	# Allocate buffers to store images in (2 here). 
+	# (Handle cases where image is larger than payload due to pixel unpacking)
+	numBuffers = acquisition_frame_counts
+	print(" Allocate ",numBuffers," buffers :")
+	buffer_addresses = ((ctypes.c_void_p)*numBuffers)()
+	
+	bufsize = payload_size.value
+	bufsize_unpacked = int(width_str.value) * int(height_str.value) * pygigev.GevGetPixelSizeInBytes( pixel_format_unpacked )
+	print("Pixel Size in Bytes:", pygigev.GevGetPixelSizeInBytes( pixel_format_unpacked ))
+	if (bufsize_unpacked > bufsize):
+		bufsize = bufsize_unpacked
+	print(" Using bufsize = ", bufsize);
+
+	for bufIndex in range(numBuffers):
+		temp = ((ctypes.c_char)*bufsize)()
+		buffer_addresses[bufIndex] = ctypes.cast( temp, ctypes.c_void_p)
+		# print(" buffer_addresses[",bufIndex,"] = ",hex(buffer_addresses[bufIndex]))
+	
+	# Initialize a transfer (Asynchronous cycling)
+	print("Init transfer :")
+	# status = pygigev.GevInitializeTransfer( handle, pygigev.Asynchronous, payload_size, numBuffers, buffer_addresses)
+	status = pygigev.GevInitializeTransfer( handle, pygigev.Asynchronous, payload_size, numBuffers, buffer_addresses)
+
+	
+	# pixFormat = (ctypes.c_uint32)()
+	# pixDepth = (ctypes.c_uint32)()
+	# convertedGevFormat = (ctypes.c_uint32)()
+	# convertedGevFormat = pygigev.GevGetConvertedPixelType(1, pixel_format)
+	# print(f"Bayer:{pygigev.GevIsPixelTypeBayer(pixel_format)}, RGB:{pygigev.GevIsPixelTypeRGB(pixel_format)}")
+	# status = pygigev.GetX11DisplayablePixelFormat(pygigev.ENABLE_BAYER_CONVERSION, format, convertedGevFormat, pixFormat);
+	
+	# Grab images to fill the buffers 
+	numImages = numBuffers
+	print("Snap ",numImages," images :")
+	# chunksize = 1000
+	# frames_buffer = np.zeros((chunksize,int(height_str.value),int(width_str.value),3), dtype=np.float32)
+	frames_buffer = np.frombuffer(buffer.get_obj(),dtype='f').reshape((buffer_size,h,w,3))
+	buffer_wr = np.frombuffer(buffer_write.get_obj(),dtype='f').reshape((buffer_size,h,w,3))
+
+	if save.value:
+		# with h5py.File("frames.h5", 'w') as f:
+			# with open("frames.gevbuf", "w+b") as f:
+			status = pygigev.GevStartTransfer(handle, numImages)
+			
+			# Read the images out
+			gevbufPtr = ctypes.POINTER(pygigev.GEV_BUFFER_OBJECT)()
+			displayed = 0
+			# ds = f.create_dataset("frames", (buffer_size,h,w,3), maxshape=(None,h,w,3), chunks=(buffer_size,h,w,3), dtype=np.float32, compression="lzf")
+			# ds.attrs['count'] = 0
+			print(bufsize_unpacked)
+			# f.write(numBuffers*bufsize_unpacked*b"\0")
+			# f.flush()
+			# f.seek(0)
+			# with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+			n, m = 0, 0
+			print(f"started")
+			acq_status.value = True
+			t0 = time.time()
+			for imgIndex in range(numImages):
+				tmout = (ctypes.c_uint32)(1000)
+				status = pygigev.GevWaitForNextFrame( handle, ctypes.byref(gevbufPtr), tmout.value )
+				if status == 0 :
+					grab_frame(gevbufPtr, frames_buffer, m)
+					frame_count.value = n
+					n += 1
+					m += 1
+					if (n%buffer_size) == 0:
+						buffer_wr = frames_buffer/255
+						write_ready.value = True
+						# ds[-buffer_size:,:,:,:,] = frames_buffer/255
+						# ds.resize(int((n//buffer_size)+1)*buffer_size, axis=0)
+						# ds.attrs['count'] = n-1
+						m = 0
+			# print(f"total captured time: {time.time()-t0:.3f} [s]")
+			buffer_wr = frames_buffer/255
+			write_ready.value = True
+			# ds[-buffer_size:,:,:,:] = frames_buffer/255
+			# ds.attrs['count'] = n
+	else:
+		status = pygigev.GevStartTransfer(handle, numImages)
+		gevbufPtr = ctypes.POINTER(pygigev.GEV_BUFFER_OBJECT)()
+		n, m = 0, 0
+		print(f"started")
+		acq_status.value = True
+		t0 = time.time()
+		for imgIndex in range(numImages):
+			tmout = (ctypes.c_uint32)(1000)
+			status = pygigev.GevWaitForNextFrame( handle, ctypes.byref(gevbufPtr), tmout.value )
+			if status == 0 :
+				grab_frame(gevbufPtr, frames_buffer, m)
+				frame_count.value = n
+				n += 1
+				m += 1
+				if (n%buffer_size) == 0:
+					m = 0
+		
+	print("\n")
+	acq_status.value = False
+	# Free the transfer
+	print("Free transfer :")
+	status = pygigev.GevFreeTransfer(handle)
+
+	# Close the camera
+	print("Close camera :")
+	status = pygigev.GevCloseCamera( ctypes.byref(handle) )
+	
+	# Uninitialize
+	pygigev.GevApiUninitialize()
+
+	# with h5py.File("frames.h5",'r') as f:
+	# 	print(f.keys())
+	# 	print(f['frames'].shape)
+	# 	fig,ax = plt.subplots(2,2,sharex=True,sharey=True)
+	# 	ax = ax.flatten()
+	# 	frame = 0
+	# 	for n in range(4):
+	# 		# plt.figure()
+	# 		if n == 0:
+	# 			ax[n].imshow(f['frames'][frame,:,:,:])
+	# 			ax[n].set_title('Colored Image')
+	# 		else:
+	# 			_p = ax[n].matshow(f['frames'][frame,:,:,n-1],cmap=channels[list(channels.keys())[n-1]])
+	# 			ax[n].set_title(f"Channel {list(channels.keys())[n-1]}")
+	# 			_cbar = plt.colorbar(_p,ax=ax[n])
+	# 			print(np.max(f['frames'][frame,:,:,n-1]))
+	# 		ax[n].set_xlabel('Pixel')
+	# 		ax[n].set_ylabel('Pixel')
+	# 	plt.tight_layout()
+	# 	plt.show()
+#
+# Call the actual main function
+#
+
+def live_show(refresh_rate, acq_status, buffer):
+	while True:
+		if acq_status.value:
+			frames_buffer = np.frombuffer(buffer.get_obj(),dtype='f').reshape((buffer_size,h,w,3))
+			# with h5py.File("frames.h5",'r') as f:
+			fig,ax = plt.subplots(2,2,figsize=(10,8),sharex=True,sharey=True)
+			ax = ax.flatten()
+			p = [0]*4
+			cbar = [0]*4
+			for n in range(4):
+				# plt.figure()
+				if n == 0:
+					p[n] = ax[n].imshow(0*frames_buffer[0,:,:,:])
+					ax[n].set_title('Colored Image')
+				else:
+					p[n] = ax[n].matshow(0*frames_buffer[0,:,:,n-1],cmap=channels[list(channels.keys())[n-1]])
+					ax[n].set_title(f"Channel {list(channels.keys())[n-1]}")
+					cbar[n] = plt.colorbar(p[n],ax=ax[n])
+					# print(np.max(f['frames'][_frame,:,:,n-1]))
+				ax[n].set_xlabel('Pixel')
+				ax[n].set_ylabel('Pixel')
+			plt.ion()
+			plt.tight_layout()
+			plt.show()
+			print("="*60)
+			print(f"{'fps':<12s} {'frame #':<12s} {'time [s]':<12s}\r")
+			print("="*60)
+			# print(f"{'':<12s} frame #: {'':<12s} time: {'':<12s}[s]\r", end='')
+			t0 = time.time()
+			t1 = t0 + 0
+			frame_count_last = 0
+			while True:
+				# print(f.keys())
+				# print(f['frames'].shape)
+				_frame = frames_buffer[int(frame_count.value % buffer_size),:,:,:]/255
+				# print(_frame.max())
+				for n in range(4):
+					# plt.figure()
+					if n == 0:
+						p[n].set_array(_frame)
+						# p[n].set_clim(None,None)
+					else:
+						p[n].set_array(_frame[:,:,n-1])
+						# p[n].set_clim(None,None)
+						cbar[n].update_normal(p[n])
+					# print(np.max(f['frames'][_frame,:,:,:]))
+				# plt.tight_layout()
+				fig.canvas.draw()
+				fig.canvas.flush_events()
+				time.sleep(1.0/refresh_rate)
+				print(f"{(frame_count.value-frame_count_last)/(time.time()-t0-t1):<12.3f} {frame_count.value:<12} {time.time()-t0:<12.3}\r", end='')
+				# print(f"\rframe #: {frame_count.value:<8}", end='')
+				frame_count_last = frame_count.value
+				t1 = time.time()-t0
+				if not acq_status.value:
+					print(f"\naverage fps: {frame_count.value/t1:.3f}")
+					break
+			time.sleep(1)
+
+def write(acq_status,buffer,write_ready,save):
+	while True:
+		if acq_status.value:
+			if save.value:
+				with h5py.File("frames.h5", 'w') as f:
+					ds = f.create_dataset("frames", (buffer_size,h,w,3), maxshape=(None,h,w,3), chunks=(buffer_size,h,w,3), dtype=np.float32, compression="lzf")
+					buffer_write = np.frombuffer(buffer.get_obj(),dtype='f').reshape((buffer_size,h,w,3))
+					while True:
+						if write_ready.value:
+							ds[-buffer_size:,:,:,:,] = buffer_write/255
+							ds.resize(int(len(ds) + buffer_size), axis=0)
+							write_ready.value = False
+						time.sleep(0.1)
+			time.sleep(1)
+
+
+w, h = 80, 100			# in pixel
+framerate = 1000			# fps
+exposure_time = 900		# in us
+acquisition_frame_counts = 200000
+save = Value('b',True)
+buffer_size = min(10000, acquisition_frame_counts)
+buffer = Array('f',int(buffer_size*h*w*3))
+buffer_write = Array('f',int(buffer_size*h*w*3))
+write_ready = Value('b',False)
+acq_status = Value('b',False)
+frame_count = Value('i',0)
+th_live_show = Thread(target=acquisition, args=(acq_status,buffer,buffer_write,write_ready,save,))
+th_live_show.start()
+th_write = Process(target=write, args=(acq_status,buffer,write_ready,save,))
+th_write.start()
+
+if __name__ == "__main__":
+	live_show(30, acq_status, buffer)
+	# time.sleep(10)
